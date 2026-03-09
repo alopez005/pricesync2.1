@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PriceSync 2.1 — Sincronizador de Stock y Precios</title>
+  <meta name="description" content="Sincroniza stock y precios entre tu software de gestión y Tienda Nube">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0b1120; }
+    #root { min-height: 100vh; }
+    select option { background: #1e293b; color: #e2e8f0; }
+    input[type="number"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button { opacity: 1; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useRef, useMemo, useEffect } = React;
+
+    // ─── helpers ───────────────────────────────────────────────────────────
+    function normalize(s) {
+      if (!s) return "";
+      return String(s).trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+    }
+
+    function parseCSV(text) {
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length === 0) return { headers: [], rows: [], delimiter: "," };
+      const firstLine = lines[0];
+      const commaCount = (firstLine.match(/,/g) || []).length;
+      const semicolonCount = (firstLine.match(/;/g) || []).length;
+      const delimiter = semicolonCount > commaCount ? ";" : ",";
+      
+      function splitCSVLine(line) {
+        const result = [];
+        let current = "";
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+            else { inQuotes = !inQuotes; }
+          } else if (ch === delimiter && !inQuotes) {
+            result.push(current.trim());
+            current = "";
+          } else {
+            current += ch;
+          }
+        }
+        result.push(current.trim());
+        return result;
+      }
+
+      const headers = splitCSVLine(lines[0]);
+      const rows = lines.slice(1).map(l => {
+        const vals = splitCSVLine(l);
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = vals[i] || ""; });
+        return obj;
+      });
+      return { headers, rows, delimiter };
+    }
+
+    async function readFileText(file) {
+      const textUtf8 = await file.text();
+      if (!textUtf8.includes("\uFFFD")) return textUtf8;
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Error leyendo archivo"));
+        reader.readAsText(file, "windows-1252");
+      });
+    }
+
+    async function parseExcel(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const wb = XLSX.read(e.target.result, { type: "array" });
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
+            const headers = data.length > 0 ? Object.keys(data[0]) : [];
+            resolve({ headers, rows: data });
+          } catch (err) { reject(err); }
+        };
+        reader.onerror = () => reject(new Error("Error leyendo archivo"));
+        reader.readAsArrayBuffer(file);
+      });
+    }
+
+    function detectColumn(headers, keywords) {
+      const norm = headers.map(h => normalize(h));
+      for (const kw of keywords) {
+        const idx = norm.findIndex(h => h.includes(kw));
+        if (idx !== -1) return headers[idx];
+      }
+      return null;
+    }
+
+    // ─── main component ───────────────────────────────────────────────────
+    function PriceSync() {
+      const [gestData, setGestData] = useState(null);
+      const [tnData, setTnData] = useState(null);
+      const [gestFile, setGestFile] = useState(null);
+      const [tnFile, setTnFile] = useState(null);
+      const [gestMapping, setGestMapping] = useState({ barcode: "", name: "", stock: "", price: "" });
+      const [tnMapping, setTnMapping] = useState({ barcode: "", name: "", stock: "", sku: "", price: "" });
+      const [matched, setMatched] = useState(null);
+      const [step, setStep] = useState(1);
+      const [searchTerm, setSearchTerm] = useState("");
+      const [stockOffset, setStockOffset] = useState(1);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState(null);
+      const gestRef = useRef(null);
+      const tnRef = useRef(null);
+
+      const handleGestFile = useCallback(async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        setGestFile(file);
+        setLoading(true);
+        setError(null);
+        try {
+          let data;
+          if (file.name.match(/\.xlsx?$/i) || file.name.match(/\.xlsm$/i)) {
+            data = await parseExcel(file);
+          } else {
+            const text = await readFileText(file);
+            data = parseCSV(text);
+          }
+          setGestData(data);
+          setGestMapping({
+            barcode: detectColumn(data.headers, ["codigo de barra", "codigo_barra", "barcode", "ean", "cod_barra", "codigo barra", "codigodebarra", "cod barra"]) || "",
+            name: detectColumn(data.headers, ["nombre", "descripcion", "producto", "articulo", "name", "detalle", "denominacion"]) || "",
+            stock: detectColumn(data.headers, ["stock", "cantidad", "existencia", "qty", "inventario", "disponible", "saldo"]) || "",
+            price: detectColumn(data.headers, ["precio lista 2", "precio_lista2", "precio lista2", "preciolista2", "lista 2", "lista2", "precio de lista 2", "precio venta", "precio", "price", "pvp", "precio lista"]) || "",
+          });
+        } catch (err) { setError("Error al leer archivo de gestión: " + err.message); }
+        setLoading(false);
+      }, []);
+
+      const handleTnFile = useCallback(async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        setTnFile(file);
+        setLoading(true);
+        setError(null);
+        try {
+          const text = await readFileText(file);
+          const data = parseCSV(text);
+          setTnData(data);
+          setTnMapping({
+            barcode: detectColumn(data.headers, ["codigo de barra", "codigo_barra", "barcode", "ean", "cod_barra", "codigo barra", "codigodebarra", "cod barra"]) || "",
+            name: detectColumn(data.headers, ["nombre", "descripcion", "producto", "name", "titulo"]) || "",
+            stock: detectColumn(data.headers, ["stock", "cantidad", "existencia", "qty", "inventario"]) || "",
+            sku: detectColumn(data.headers, ["sku", "codigo", "identificador", "variante"]) || "",
+            price: detectColumn(data.headers, ["precio", "price", "precio venta", "precio_venta", "pvp", "precio lista", "precio de venta", "valor"]) || "",
+          });
+        } catch (err) { setError("Error al leer CSV de Tienda Nube: " + err.message); }
+        setLoading(false);
+      }, []);
+
+      const runMatch = useCallback(() => {
+        if (!gestData || !tnData) return;
+        setLoading(true);
+        const results = [];
+        const usedTnIdxs = new Set();
+
+        if (gestMapping.barcode && tnMapping.barcode) {
+          gestData.rows.forEach((gRow) => {
+            const gBarcode = String(gRow[gestMapping.barcode] || "").trim();
+            if (!gBarcode) return;
+            const tnIdx = tnData.rows.findIndex((tRow, idx) => {
+              if (usedTnIdxs.has(idx)) return false;
+              return String(tRow[tnMapping.barcode] || "").trim() === gBarcode;
+            });
+            if (tnIdx !== -1) {
+              usedTnIdxs.add(tnIdx);
+              const gestStock = parseInt(gRow[gestMapping.stock]) || 0;
+              const newStock = Math.max(0, gestStock - stockOffset);
+              const gestPrice = gestMapping.price ? String(gRow[gestMapping.price] || "").trim() : "";
+              results.push({ matchType: "barcode", gestName: gRow[gestMapping.name] || "", tnName: tnData.rows[tnIdx][tnMapping.name] || "", barcode: gBarcode, gestStock, gestPrice, tnStock: parseInt(tnData.rows[tnIdx][tnMapping.stock]) || 0, tnPrice: tnMapping.price ? String(tnData.rows[tnIdx][tnMapping.price] || "").trim() : "", newStock, newPrice: gestPrice, tnIdx, tnRow: tnData.rows[tnIdx], confirmed: true });
+            }
+          });
+        }
+
+        if (gestMapping.name && tnMapping.name) {
+          gestData.rows.forEach((gRow) => {
+            const gName = normalize(gRow[gestMapping.name]);
+            if (!gName) return;
+            const gBarcode = gestMapping.barcode ? String(gRow[gestMapping.barcode] || "").trim() : "";
+            if (gBarcode && results.some(r => r.barcode === gBarcode)) return;
+            let bestIdx = -1, bestScore = 0;
+            tnData.rows.forEach((tRow, idx) => {
+              if (usedTnIdxs.has(idx)) return;
+              const tName = normalize(tRow[tnMapping.name]);
+              if (!tName) return;
+              let score = 0;
+              if (gName === tName) score = 100;
+              else if (gName.includes(tName) || tName.includes(gName)) score = 70;
+              else {
+                const gWords = new Set(gName.split(" ").filter(w => w.length > 2));
+                const tWords = new Set(tName.split(" ").filter(w => w.length > 2));
+                let overlap = 0;
+                gWords.forEach(w => { if (tWords.has(w)) overlap++; });
+                score = (overlap / Math.max(gWords.size, tWords.size, 1)) * 60;
+              }
+              if (score > bestScore && score >= 30) { bestScore = score; bestIdx = idx; }
+            });
+            if (bestIdx !== -1) {
+              usedTnIdxs.add(bestIdx);
+              const gestStock = parseInt(gRow[gestMapping.stock]) || 0;
+              const newStock = Math.max(0, gestStock - stockOffset);
+              const gestPrice = gestMapping.price ? String(gRow[gestMapping.price] || "").trim() : "";
+              results.push({ matchType: bestScore >= 70 ? "name_strong" : "name_weak", gestName: gRow[gestMapping.name] || "", tnName: tnData.rows[bestIdx][tnMapping.name] || "", barcode: gBarcode, gestStock, gestPrice, tnStock: parseInt(tnData.rows[bestIdx][tnMapping.stock]) || 0, tnPrice: tnMapping.price ? String(tnData.rows[bestIdx][tnMapping.price] || "").trim() : "", newStock, newPrice: gestPrice, tnIdx: bestIdx, tnRow: tnData.rows[bestIdx], matchScore: bestScore, confirmed: bestScore >= 70 });
+            }
+          });
+        }
+        setMatched(results);
+        setStep(3);
+        setLoading(false);
+      }, [gestData, tnData, gestMapping, tnMapping, stockOffset]);
+
+      const toggleConfirm = useCallback((idx) => {
+        setMatched(prev => prev.map((r, i) => i === idx ? { ...r, confirmed: !r.confirmed } : r));
+      }, []);
+      const editNewStock = useCallback((idx, val) => {
+        setMatched(prev => prev.map((r, i) => i === idx ? { ...r, newStock: Math.max(0, parseInt(val) || 0) } : r));
+      }, []);
+      const editNewPrice = useCallback((idx, val) => {
+        setMatched(prev => prev.map((r, i) => i === idx ? { ...r, newPrice: val } : r));
+      }, []);
+
+      const [downloadUrl, setDownloadUrl] = useState(null);
+      const [barcodesAdded, setBarcodesAdded] = useState(0);
+
+      const generateCSV = useCallback(() => {
+        if (!matched || !tnData) return;
+        const confirmedMap = new Map();
+        const barcodeMap = new Map();
+        const priceMap = new Map();
+        matched.filter(r => r.confirmed).forEach(r => {
+          confirmedMap.set(r.tnIdx, r.newStock);
+          if (r.matchType !== "barcode" && r.barcode) {
+            const tnBarcode = tnMapping.barcode ? String(r.tnRow[tnMapping.barcode] || "").trim() : "";
+            if (!tnBarcode && tnMapping.barcode) barcodeMap.set(r.tnIdx, r.barcode);
+          }
+          if (tnMapping.price && r.newPrice) priceMap.set(r.tnIdx, r.newPrice);
+        });
+        const delim = tnData.delimiter || ",";
+        const header = tnData.headers.map(h => h.includes(delim) || h.includes('"') ? '"' + h.replace(/"/g, '""') + '"' : h).join(delim);
+        const rows = tnData.rows.map((row, idx) => {
+          const u = { ...row };
+          if (confirmedMap.has(idx)) u[tnMapping.stock] = confirmedMap.get(idx);
+          if (tnMapping.barcode && barcodeMap.has(idx)) u[tnMapping.barcode] = barcodeMap.get(idx);
+          if (tnMapping.price && priceMap.has(idx)) u[tnMapping.price] = priceMap.get(idx);
+          return tnData.headers.map(h => { const v = String(u[h] || ""); return v.includes(delim) || v.includes('"') || v.includes("\n") ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(delim);
+        });
+        const csv = [header, ...rows].join("\n");
+        const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+        if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+        setDownloadUrl(URL.createObjectURL(blob));
+        setBarcodesAdded(barcodeMap.size);
+      }, [matched, tnData, tnMapping, downloadUrl]);
+
+      const [filterType, setFilterType] = useState("all");
+      const filtered = useMemo(() => {
+        if (!matched) return [];
+        let list = matched;
+        if (filterType === "barcode") list = list.filter(r => r.matchType === "barcode");
+        else if (filterType === "name") list = list.filter(r => r.matchType !== "barcode");
+        else if (filterType === "name_weak") list = list.filter(r => r.matchType === "name_weak");
+        else if (filterType === "name_strong") list = list.filter(r => r.matchType === "name_strong");
+        if (searchTerm) { const term = normalize(searchTerm); list = list.filter(r => normalize(r.gestName).includes(term) || normalize(r.tnName).includes(term) || (r.barcode && r.barcode.includes(searchTerm))); }
+        return list;
+      }, [matched, searchTerm, filterType]);
+
+      const stats = useMemo(() => {
+        if (!matched) return null;
+        const confirmed = matched.filter(r => r.confirmed).length;
+        const byBarcode = matched.filter(r => r.matchType === "barcode").length;
+        const byNameStrong = matched.filter(r => r.matchType === "name_strong").length;
+        const byNameWeak = matched.filter(r => r.matchType === "name_weak").length;
+        return { total: matched.length, confirmed, byBarcode, byName: byNameStrong + byNameWeak, byNameStrong, byNameWeak };
+      }, [matched]);
+
+      const Sel = ({ label, value, options, onChange }) => (
+        <div style={{ flex: 1, minWidth: 160 }}>
+          <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>{label}</label>
+          <select value={value} onChange={e => onChange(e.target.value)} style={{ width: "100%", padding: "10px 12px", background: "#1e293b", color: "#e2e8f0", border: "1px solid #334155", borderRadius: 8, fontSize: 14, cursor: "pointer", outline: "none" }}>
+            <option value="">— Seleccionar —</option>
+            {options.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+      );
+
+      const Badge = ({ type, score }) => {
+        const s = { barcode: { bg: "#065f46", color: "#6ee7b7", label: "Cód. Barras" }, name_strong: { bg: "#1e3a5f", color: "#7dd3fc", label: "Nombre ✓" }, name_weak: { bg: "#713f12", color: "#fde68a", label: `~${Math.round(score || 0)}%` } }[type] || { bg: "#713f12", color: "#fde68a", label: "?" };
+        return <span style={{ display: "inline-block", padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 700, background: s.bg, color: s.color, letterSpacing: 0.5 }}>{s.label}</span>;
+      };
+
+      const th = { padding: "12px 14px", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 };
+
+      return (
+        <div style={{ minHeight: "100vh", background: "linear-gradient(145deg, #0b1120 0%, #0f172a 50%, #121d33 100%)", color: "#e2e8f0", fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif" }}>
+          <div style={{ padding: "28px 32px 20px", borderBottom: "1px solid #1e293b" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{ width: 42, height: 42, borderRadius: 12, background: "linear-gradient(135deg, #3b82f6, #8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>⚡</div>
+              <div>
+                <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800, background: "linear-gradient(90deg, #60a5fa, #a78bfa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>PriceSync 2.1</h1>
+                <p style={{ margin: 0, fontSize: 12, color: "#64748b", fontWeight: 500 }}>Sincronizador de stock y precios · Gestión → Tienda Nube</p>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+              {["Subir archivos", "Mapear columnas", "Vista previa y descarga"].map((label, i) => (
+                <div key={i} onClick={() => { if (i + 1 < step || (i + 1 === 2 && gestData && tnData) || (i + 1 === 3 && matched)) setStep(i + 1); }}
+                  style={{ flex: 1, padding: "10px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: step > i + 1 || (i + 1 <= step) ? "pointer" : "default", background: step === i + 1 ? "linear-gradient(135deg, #1e3a5f, #1e293b)" : step > i + 1 ? "#1a2744" : "#0f172a", border: step === i + 1 ? "1px solid #3b82f6" : "1px solid #1e293b", color: step === i + 1 ? "#60a5fa" : step > i + 1 ? "#94a3b8" : "#475569", transition: "all 0.2s" }}>
+                  <span style={{ marginRight: 8, opacity: 0.6 }}>{i + 1}.</span>{label}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ padding: "24px 32px", maxWidth: 1200, margin: "0 auto" }}>
+            {error && <div style={{ padding: "12px 16px", background: "#451a1a", border: "1px solid #7f1d1d", borderRadius: 10, marginBottom: 20, fontSize: 14, color: "#fca5a5" }}>⚠️ {error}</div>}
+
+            {step === 1 && (
+              <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+                {[{ ref: gestRef, file: gestFile, data: gestData, handler: handleGestFile, title: "📊 Archivo de Gestión", desc: "Excel (.xlsx/.xls) o CSV de tu software de juguetería", accept: ".xlsx,.xls,.xlsm,.csv,.tsv" },
+                  { ref: tnRef, file: tnFile, data: tnData, handler: handleTnFile, title: "🛒 CSV Tienda Nube", desc: "Archivo CSV descargado de Tienda Nube", accept: ".csv,.tsv" }].map((f, i) => (
+                  <div key={i} style={{ flex: 1, minWidth: 300, padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14 }}>
+                    <h3 style={{ margin: "0 0 6px", fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>{f.title}</h3>
+                    <p style={{ margin: "0 0 16px", fontSize: 13, color: "#64748b" }}>{f.desc}</p>
+                    <input ref={f.ref} type="file" accept={f.accept} onChange={f.handler} style={{ display: "none" }} />
+                    <button onClick={() => f.ref.current?.click()} style={{ width: "100%", padding: "32px 20px", background: f.file ? "#0c2d1f" : "#111827", border: f.file ? "2px solid #065f46" : "2px dashed #334155", borderRadius: 12, cursor: "pointer", color: "#e2e8f0", fontSize: 14, transition: "all 0.2s" }}>
+                      {f.file ? <div><div style={{ fontSize: 28, marginBottom: 6 }}>✅</div><div style={{ fontWeight: 700 }}>{f.file.name}</div><div style={{ fontSize: 12, color: "#6ee7b7", marginTop: 4 }}>{f.data?.rows.length || 0} productos</div></div>
+                      : <div><div style={{ fontSize: 28, marginBottom: 6 }}>📁</div><div style={{ fontWeight: 600 }}>Click para seleccionar</div></div>}
+                    </button>
+                    {f.data && <div style={{ marginTop: 12, padding: 12, background: "#1a2744", borderRadius: 8, fontSize: 12, color: "#94a3b8" }}><strong>Columnas:</strong> {f.data.headers.slice(0, 6).join(", ")}{f.data.headers.length > 6 ? "..." : ""}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {step === 1 && gestData && tnData && <div style={{ textAlign: "center", marginTop: 24 }}><button onClick={() => setStep(2)} style={{ padding: "14px 40px", background: "linear-gradient(135deg, #3b82f6, #6366f1)", color: "#fff", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700, cursor: "pointer" }}>Continuar → Mapear columnas</button></div>}
+
+            {step === 2 && (
+              <div>
+                <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
+                  <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700 }}>📊 Columnas del archivo de Gestión</h3>
+                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                    <Sel label="Código de barras" value={gestMapping.barcode} options={gestData?.headers || []} onChange={v => setGestMapping(p => ({ ...p, barcode: v }))} />
+                    <Sel label="Nombre / Descripción" value={gestMapping.name} options={gestData?.headers || []} onChange={v => setGestMapping(p => ({ ...p, name: v }))} />
+                    <Sel label="Stock" value={gestMapping.stock} options={gestData?.headers || []} onChange={v => setGestMapping(p => ({ ...p, stock: v }))} />
+                    <Sel label="Precio (Lista 2)" value={gestMapping.price} options={gestData?.headers || []} onChange={v => setGestMapping(p => ({ ...p, price: v }))} />
+                  </div>
+                </div>
+                <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
+                  <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700 }}>🛒 Columnas del CSV Tienda Nube</h3>
+                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                    <Sel label="Código de barras" value={tnMapping.barcode} options={tnData?.headers || []} onChange={v => setTnMapping(p => ({ ...p, barcode: v }))} />
+                    <Sel label="Nombre / Descripción" value={tnMapping.name} options={tnData?.headers || []} onChange={v => setTnMapping(p => ({ ...p, name: v }))} />
+                    <Sel label="Stock" value={tnMapping.stock} options={tnData?.headers || []} onChange={v => setTnMapping(p => ({ ...p, stock: v }))} />
+                    <Sel label="Precio (destino)" value={tnMapping.price} options={tnData?.headers || []} onChange={v => setTnMapping(p => ({ ...p, price: v }))} />
+                  </div>
+                </div>
+                <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
+                  <h3 style={{ margin: "0 0 12px", fontSize: 16, fontWeight: 700 }}>⚙️ Configuración de stock</h3>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+                    <div>
+                      <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Restar al stock</label>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button onClick={() => setStockOffset(Math.max(0, stockOffset - 1))} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>−</button>
+                        <input type="number" value={stockOffset} onChange={e => setStockOffset(Math.max(0, parseInt(e.target.value) || 0))} style={{ width: 60, padding: "8px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 16, textAlign: "center" }} />
+                        <button onClick={() => setStockOffset(stockOffset + 1)} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>+</button>
+                      </div>
+                    </div>
+                    <p style={{ margin: 0, fontSize: 13, color: "#64748b", maxWidth: 400 }}>Stock final: <strong style={{ color: "#60a5fa" }}>gestión − {stockOffset}</strong>. Ej: 4 en gestión → <strong style={{ color: "#6ee7b7" }}>{Math.max(0, 4 - stockOffset)}</strong> en TN.</p>
+                  </div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <button onClick={runMatch} disabled={!gestMapping.stock || !tnMapping.stock || (!gestMapping.barcode && !gestMapping.name) || (!tnMapping.barcode && !tnMapping.name)} style={{ padding: "14px 40px", background: "linear-gradient(135deg, #3b82f6, #6366f1)", color: "#fff", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700, cursor: "pointer", opacity: (!gestMapping.stock || !tnMapping.stock) ? 0.4 : 1 }}>🔍 Sincronizar productos</button>
+                </div>
+              </div>
+            )}
+
+            {step === 3 && matched && (
+              <div>
+                <div style={{ display: "flex", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
+                  {[{ key: "all", label: "Total", val: stats.total, color: "#60a5fa", bg: "#1e3a5f" }, { key: "barcode", label: "Cód. Barras", val: stats.byBarcode, color: "#6ee7b7", bg: "#065f46" }, { key: "name", label: "Por nombre", val: stats.byName, color: "#fbbf24", bg: "#713f12" }, { key: "name_weak", label: "Dudosos ⚠️", val: stats.byNameWeak, color: "#fb923c", bg: "#7c2d12" }].map(s => (
+                    <div key={s.key} onClick={() => setFilterType(filterType === s.key ? "all" : s.key)} style={{ flex: 1, minWidth: 130, padding: "16px 20px", borderRadius: 12, cursor: "pointer", transition: "all 0.2s", background: filterType === s.key ? s.bg + "90" : s.bg + "40", border: filterType === s.key ? `2px solid ${s.color}` : `1px solid ${s.bg}` }}>
+                      <div style={{ fontSize: 28, fontWeight: 800, color: s.color }}>{s.val}</div>
+                      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>{s.label}</div>
+                      {filterType === s.key && s.key !== "all" && <div style={{ fontSize: 10, color: s.color, marginTop: 4, fontWeight: 700 }}>✕ Filtro activo</div>}
+                    </div>
+                  ))}
+                </div>
+
+                {filterType !== "all" && (
+                  <div style={{ padding: "10px 16px", marginBottom: 14, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "space-between", background: "#1e293b60", border: "1px solid #334155" }}>
+                    <span style={{ fontSize: 13, color: "#e2e8f0" }}>Mostrando {filtered.length} coincidencias — {filterType === "name_weak" ? "revisá y destildá las incorrectas" : "filtro activo"}</span>
+                    <button onClick={() => setFilterType("all")} style={{ padding: "4px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 6, color: "#94a3b8", fontSize: 12, cursor: "pointer" }}>Ver todos</button>
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <input type="text" placeholder="🔍 Buscar por nombre o código..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} style={{ width: "100%", padding: "12px 16px", background: "#1e293b", border: "1px solid #334155", borderRadius: 10, color: "#e2e8f0", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <button onClick={() => setStep(2)} style={{ padding: "12px 20px", background: "#1e293b", border: "1px solid #334155", borderRadius: 10, color: "#94a3b8", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>← Volver</button>
+                  <button onClick={generateCSV} style={{ padding: "12px 24px", background: "linear-gradient(135deg, #059669, #10b981)", border: "none", borderRadius: 10, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 14px rgba(16,185,129,0.3)" }}>🔄 Generar CSV ({stats.confirmed})</button>
+                  {downloadUrl && <a href={downloadUrl} download="tiendanube_stock_actualizado.csv" style={{ padding: "12px 24px", background: "#065f46", border: "1px solid #10b981", borderRadius: 10, color: "#6ee7b7", fontSize: 14, fontWeight: 700, textDecoration: "none", display: "inline-block" }}>⬇ Descargar CSV</a>}
+                </div>
+
+                <div style={{ overflowX: "auto", borderRadius: 12, border: "1px solid #1e293b" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ background: "#1e293b" }}>
+                        <th style={{...th, textAlign: "left"}}>✓</th>
+                        <th style={{...th, textAlign: "left"}}>Match</th>
+                        <th style={{...th, textAlign: "left"}}>Producto Gestión</th>
+                        <th style={{...th, textAlign: "left"}}>Producto TiendaNube</th>
+                        <th style={{...th, textAlign: "center"}}>Stock G</th>
+                        <th style={{...th, textAlign: "center"}}>Stock TN</th>
+                        <th style={{...th, textAlign: "center"}}>Nuevo</th>
+                        {gestMapping.price && tnMapping.price && <><th style={{...th, textAlign: "center"}}>$ Gestión</th><th style={{...th, textAlign: "center"}}>$ TN</th><th style={{...th, textAlign: "center"}}>$ Nuevo</th></>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.length === 0 && <tr><td colSpan={gestMapping.price && tnMapping.price ? 10 : 7} style={{ padding: 40, textAlign: "center", color: "#475569" }}>Sin coincidencias</td></tr>}
+                      {filtered.map((r, i) => {
+                        const ri = matched.indexOf(r);
+                        return (
+                          <tr key={i} style={{ borderTop: "1px solid #1e293b", background: r.confirmed ? "transparent" : "#1a0a0a50" }}>
+                            <td style={{ padding: "10px 14px" }}><input type="checkbox" checked={r.confirmed} onChange={() => toggleConfirm(ri)} style={{ width: 18, height: 18, cursor: "pointer", accentColor: "#3b82f6" }} /></td>
+                            <td style={{ padding: "10px 14px" }}><Badge type={r.matchType} score={r.matchScore} /></td>
+                            <td style={{ padding: "10px 14px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              <div style={{ fontWeight: 600, color: "#f1f5f9" }}>{r.gestName}</div>
+                              {r.barcode && <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>CB: {r.barcode}</div>}
+                            </td>
+                            <td style={{ padding: "10px 14px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              <div style={{ fontWeight: 600, color: "#f1f5f9" }}>{r.tnName}</div>
+                              {r.confirmed && r.matchType !== "barcode" && r.barcode && tnMapping.barcode && !String(r.tnRow[tnMapping.barcode] || "").trim() && <div style={{ fontSize: 11, color: "#a78bfa", marginTop: 2 }}>📋 CB: {r.barcode}</div>}
+                              {tnMapping.barcode && String(r.tnRow[tnMapping.barcode] || "").trim() && <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>CB: {String(r.tnRow[tnMapping.barcode]).trim()}</div>}
+                            </td>
+                            <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 15 }}>{r.gestStock}</td>
+                            <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#64748b", fontSize: 15 }}>{r.tnStock}</td>
+                            <td style={{ padding: "10px 14px", textAlign: "center" }}><input type="number" value={r.newStock} onChange={e => editNewStock(ri, e.target.value)} style={{ width: 64, padding: "6px 8px", background: "#0f2e1f", border: "1px solid #065f46", borderRadius: 6, color: "#6ee7b7", fontSize: 15, fontWeight: 800, textAlign: "center" }} /></td>
+                            {gestMapping.price && tnMapping.price && <>
+                              <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 14 }}>${r.gestPrice || "—"}</td>
+                              <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#64748b", fontSize: 14 }}>${r.tnPrice || "—"}</td>
+                              <td style={{ padding: "10px 14px", textAlign: "center" }}><input type="text" value={r.newPrice || ""} onChange={e => editNewPrice(ri, e.target.value)} style={{ width: 80, padding: "6px 8px", background: "#1a1a2e", border: "1px solid #3b1f7a", borderRadius: 6, color: "#c4b5fd", fontSize: 14, fontWeight: 800, textAlign: "center" }} /></td>
+                            </>}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {matched.length > 0 && (
+                  <div style={{ textAlign: "center", marginTop: 24 }}>
+                    <button onClick={generateCSV} style={{ padding: "16px 48px", background: "linear-gradient(135deg, #059669, #10b981)", border: "none", borderRadius: 12, color: "#fff", fontSize: 18, fontWeight: 800, cursor: "pointer", boxShadow: "0 6px 20px rgba(16,185,129,0.35)" }}>🔄 Generar CSV para Tienda Nube</button>
+                    {downloadUrl && <div style={{ marginTop: 14 }}><a href={downloadUrl} download="tiendanube_stock_actualizado.csv" style={{ display: "inline-block", padding: "16px 48px", background: "#065f46", border: "2px solid #10b981", borderRadius: 12, color: "#6ee7b7", fontSize: 18, fontWeight: 800, textDecoration: "none", boxShadow: "0 6px 20px rgba(16,185,129,0.25)" }}>⬇ Descargar CSV</a></div>}
+                    <p style={{ marginTop: 10, fontSize: 12, color: "#64748b" }}>{stats.confirmed} productos confirmados</p>
+                    {downloadUrl && barcodesAdded > 0 && <div style={{ marginTop: 8, padding: "8px 16px", display: "inline-block", background: "#2e1065", border: "1px solid #7c3aed", borderRadius: 8 }}><span style={{ fontSize: 13, color: "#c4b5fd" }}>📋 {barcodesAdded} código{barcodesAdded !== 1 ? "s" : ""} de barras copiado{barcodesAdded !== 1 ? "s" : ""}</span></div>}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {loading && <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999 }}><div style={{ padding: "24px 40px", background: "#1e293b", borderRadius: 16, fontSize: 16, fontWeight: 600, color: "#60a5fa" }}>⏳ Procesando...</div></div>}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<PriceSync />);
+  </script>
+</body>
+</html>
