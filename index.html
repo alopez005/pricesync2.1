@@ -318,6 +318,7 @@ function PriceSync() {
   // ── toggle confirmation ──
   const toggleConfirm = useCallback((idx) => {
     setMatched(prev => prev.map((r, i) => i === idx ? { ...r, confirmed: !r.confirmed } : r));
+    setDownloadUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
   }, []);
 
   // ── edit new stock ──
@@ -333,9 +334,11 @@ function PriceSync() {
   // ── unmatched (new) products ──
   const toggleNewProduct = useCallback((idx) => {
     setUnmatched(prev => prev.map((r, i) => i === idx ? { ...r, selected: !r.selected } : r));
+    setDownloadUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
   }, []);
   const selectAllNew = useCallback((val) => {
     setUnmatched(prev => prev.map(r => ({ ...r, selected: val })));
+    setDownloadUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
   }, []);
   const editNewProductStock = useCallback((idx, val) => {
     setUnmatched(prev => prev.map((r, i) => i === idx ? { ...r, newStock: Math.max(0, parseInt(val) || 0) } : r));
@@ -357,14 +360,12 @@ function PriceSync() {
     const priceMap = new Map();
     matched.filter(r => r.confirmed).forEach(r => {
       confirmedMap.set(r.tnIdx, r.newStock);
-      // Si matcheó por nombre y tiene código de barras del archivo gestión, guardarlo
       if (r.matchType !== "barcode" && r.barcode) {
         const tnBarcode = tnMapping.barcode ? String(r.tnRow[tnMapping.barcode] || "").trim() : "";
         if (!tnBarcode && tnMapping.barcode) {
           barcodeMap.set(r.tnIdx, r.barcode);
         }
       }
-      // Precio
       if (tnMapping.price && r.newPrice) {
         priceMap.set(r.tnIdx, r.newPrice);
       }
@@ -417,11 +418,10 @@ function PriceSync() {
 
     const csv = [header, ...rows, ...newRows].join("\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
-    setDownloadUrl(URL.createObjectURL(blob));
+    setDownloadUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
     setBarcodesAdded(barcodesAddedCount);
     setNewProductsAdded(selectedNew.length);
-  }, [matched, unmatched, tnData, tnMapping, downloadUrl]);
+  }, [matched, unmatched, tnData, tnMapping]);
 
   // ── filtered results ──
   const [filterType, setFilterType] = useState("all");
