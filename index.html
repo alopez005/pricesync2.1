@@ -21,6 +21,20 @@
     ::-webkit-scrollbar-track { background: #0f172a; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    /* Toggle switch */
+    .toggle-switch { position: relative; width: 52px; height: 28px; flex-shrink: 0; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute; cursor: pointer; inset: 0;
+      background: #334155; border-radius: 28px; transition: all 0.3s;
+    }
+    .toggle-slider::before {
+      content: ""; position: absolute; height: 22px; width: 22px;
+      left: 3px; bottom: 3px; background: #94a3b8;
+      border-radius: 50%; transition: all 0.3s;
+    }
+    .toggle-switch input:checked + .toggle-slider { background: linear-gradient(135deg, #8b5cf6, #6366f1); }
+    .toggle-switch input:checked + .toggle-slider::before { transform: translateX(24px); background: #fff; }
   </style>
 </head>
 <body>
@@ -124,7 +138,7 @@ function PriceSync() {
   const [gestFile, setGestFile] = useState(null);
   const [tnFile, setTnFile] = useState(null);
   const [gestMapping, setGestMapping] = useState({ barcode: "", name: "", stock: "", price: "" });
-  const [tnMapping, setTnMapping] = useState({ barcode: "", name: "", stock: "", sku: "", price: "" });
+  const [tnMapping, setTnMapping] = useState({ barcode: "", name: "", stock: "", sku: "", price: "", visibility: "" });
   const [matched, setMatched] = useState(null);
   const [unmatched, setUnmatched] = useState([]);
   const [step, setStep] = useState(1);
@@ -132,6 +146,7 @@ function PriceSync() {
   const [stockOffset, setStockOffset] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [syncPrices, setSyncPrices] = useState(true);
   const gestRef = useRef(null);
   const tnRef = useRef(null);
 
@@ -179,10 +194,14 @@ function PriceSync() {
         stock: detectColumn(data.headers, ["stock", "cantidad", "existencia", "qty", "inventario"]) || "",
         sku: detectColumn(data.headers, ["sku", "codigo", "identificador", "variante"]) || "",
         price: detectColumn(data.headers, ["precio", "price", "precio venta", "precio_venta", "pvp", "precio lista", "precio de venta", "valor"]) || "",
+        visibility: detectColumn(data.headers, ["mostrar en tienda", "mostrar_en_tienda", "mostrar", "visible", "publicado", "visibilidad"]) || "",
       });
     } catch (err) { setError("Error al leer CSV de Tienda Nube: " + err.message); }
     setLoading(false);
   }, []);
+
+  // Determine if price columns are effectively active (mapped AND toggle on)
+  const priceActive = syncPrices && gestMapping.price && tnMapping.price;
 
   // ── matching engine ──
   const runMatch = useCallback(() => {
@@ -361,7 +380,8 @@ function PriceSync() {
           barcodeMap.set(r.tnIdx, r.barcode);
         }
       }
-      if (tnMapping.price && r.newPrice) {
+      // Only write prices if syncPrices is enabled
+      if (syncPrices && tnMapping.price && r.newPrice) {
         priceMap.set(r.tnIdx, r.newPrice);
       }
     });
@@ -377,6 +397,10 @@ function PriceSync() {
       const updatedRow = { ...row };
       if (confirmedMap.has(idx)) {
         updatedRow[stockCol] = confirmedMap.get(idx);
+        // Set "Mostrar en tienda" based on stock
+        if (tnMapping.visibility) {
+          updatedRow[tnMapping.visibility] = confirmedMap.get(idx) > 0 ? "SI" : "NO";
+        }
       }
       if (barcodeCol && barcodeMap.has(idx)) {
         updatedRow[barcodeCol] = barcodeMap.get(idx);
@@ -400,7 +424,12 @@ function PriceSync() {
       if (tnMapping.name) newRow[tnMapping.name] = r.gestName;
       if (tnMapping.barcode && r.barcode) newRow[tnMapping.barcode] = r.barcode;
       if (tnMapping.stock) newRow[tnMapping.stock] = r.newStock;
-      if (tnMapping.price && r.newPrice) newRow[tnMapping.price] = r.newPrice;
+      // Set visibility for new products
+      if (tnMapping.visibility) {
+        newRow[tnMapping.visibility] = r.newStock > 0 ? "SI" : "NO";
+      }
+      // Only include price for new products if syncPrices is on
+      if (syncPrices && tnMapping.price && r.newPrice) newRow[tnMapping.price] = r.newPrice;
       return tnData.headers.map(h => {
         const val = String(newRow[h] || "");
         return val.includes(delim) || val.includes('"') || val.includes("\n")
@@ -422,7 +451,7 @@ function PriceSync() {
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-    setCsvInfo({ barcodes: barcodeMap.size, newProducts: selectedNew.length });
+    setCsvInfo({ barcodes: barcodeMap.size, newProducts: selectedNew.length, hiddenCount: matched.filter(r => r.confirmed && r.newStock === 0).length + selectedNew.filter(r => r.newStock === 0).length });
   }
 
   // ── filtered results ──
@@ -457,12 +486,12 @@ function PriceSync() {
   }, [matched]);
 
   // ── select component ──
-  const Select = ({ label, value, options, onChange }) => (
-    <div style={{ flex: 1, minWidth: 160 }}>
+  const Select = ({ label, value, options, onChange, disabled }) => (
+    <div style={{ flex: 1, minWidth: 160, opacity: disabled ? 0.4 : 1, pointerEvents: disabled ? "none" : "auto", transition: "opacity 0.3s" }}>
       <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>{label}</label>
-      <select value={value} onChange={e => onChange(e.target.value)} style={{
+      <select value={value} onChange={e => onChange(e.target.value)} disabled={disabled} style={{
         width: "100%", padding: "10px 12px", background: "#1e293b", color: "#e2e8f0",
-        border: "1px solid #334155", borderRadius: 8, fontSize: 14, cursor: "pointer", outline: "none"
+        border: "1px solid #334155", borderRadius: 8, fontSize: 14, cursor: disabled ? "not-allowed" : "pointer", outline: "none"
       }}>
         <option value="">— Seleccionar —</option>
         {options.map(o => <option key={o} value={o}>{o}</option>)}
@@ -605,7 +634,7 @@ function PriceSync() {
                 <Select label="Stock" value={gestMapping.stock} options={gestData?.headers || []}
                   onChange={v => setGestMapping(p => ({ ...p, stock: v }))} />
                 <Select label="Precio (Lista 2)" value={gestMapping.price} options={gestData?.headers || []}
-                  onChange={v => setGestMapping(p => ({ ...p, price: v }))} />
+                  onChange={v => setGestMapping(p => ({ ...p, price: v }))} disabled={!syncPrices} />
               </div>
             </div>
             <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
@@ -618,27 +647,53 @@ function PriceSync() {
                 <Select label="Stock" value={tnMapping.stock} options={tnData?.headers || []}
                   onChange={v => setTnMapping(p => ({ ...p, stock: v }))} />
                 <Select label="Precio (destino)" value={tnMapping.price} options={tnData?.headers || []}
-                  onChange={v => setTnMapping(p => ({ ...p, price: v }))} />
+                  onChange={v => setTnMapping(p => ({ ...p, price: v }))} disabled={!syncPrices} />
               </div>
             </div>
-            {/* Offset setting */}
-            <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
-              <h3 style={{ margin: "0 0 12px", fontSize: 16, fontWeight: 700 }}>⚙️ Configuración de stock</h3>
-              <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-                <div>
-                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Restar al stock</label>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <button onClick={() => setStockOffset(Math.max(0, stockOffset - 1))} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>−</button>
-                    <input type="number" value={stockOffset} onChange={e => setStockOffset(Math.max(0, parseInt(e.target.value) || 0))}
-                      style={{ width: 60, padding: "8px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 16, textAlign: "center" }} />
-                    <button onClick={() => setStockOffset(stockOffset + 1)} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>+</button>
+
+            {/* Sync Prices Toggle + Stock Offset - side by side */}
+            <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 20 }}>
+              {/* Stock offset setting */}
+              <div style={{ flex: 1, minWidth: 280, padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14 }}>
+                <h3 style={{ margin: "0 0 12px", fontSize: 16, fontWeight: 700 }}>⚙️ Configuración de stock</h3>
+                <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+                  <div>
+                    <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Restar al stock</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <button onClick={() => setStockOffset(Math.max(0, stockOffset - 1))} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>−</button>
+                      <input type="number" value={stockOffset} onChange={e => setStockOffset(Math.max(0, parseInt(e.target.value) || 0))}
+                        style={{ width: 60, padding: "8px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 16, textAlign: "center" }} />
+                      <button onClick={() => setStockOffset(stockOffset + 1)} style={{ width: 36, height: 36, background: "#1e293b", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 18, cursor: "pointer" }}>+</button>
+                    </div>
+                  </div>
+                  <p style={{ margin: 0, fontSize: 13, color: "#64748b", maxWidth: 400 }}>
+                    El stock final será: <strong style={{ color: "#60a5fa" }}>stock gestión − {stockOffset}</strong>. Ejemplo: si tenés 4 en gestión, Tienda Nube recibirá <strong style={{ color: "#6ee7b7" }}>{Math.max(0, 4 - stockOffset)}</strong>.
+                  </p>
+                </div>
+              </div>
+
+              {/* Sync prices toggle */}
+              <div style={{ flex: 1, minWidth: 280, padding: 24, background: "#0f172a", border: syncPrices ? "1px solid #6366f1" : "1px solid #1e293b", borderRadius: 14, transition: "border-color 0.3s" }}>
+                <h3 style={{ margin: "0 0 12px", fontSize: 16, fontWeight: 700 }}>💲 Sincronizar precios</h3>
+                <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                  <label className="toggle-switch">
+                    <input type="checkbox" checked={syncPrices} onChange={e => setSyncPrices(e.target.checked)} />
+                    <span className="toggle-slider"></span>
+                  </label>
+                  <div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: syncPrices ? "#a78bfa" : "#64748b", transition: "color 0.3s" }}>
+                      {syncPrices ? "Activado" : "Desactivado"}
+                    </div>
+                    <p style={{ margin: "4px 0 0", fontSize: 13, color: "#64748b", maxWidth: 300 }}>
+                      {syncPrices
+                        ? "Los precios de gestión se copiarán al CSV de Tienda Nube."
+                        : "Solo se sincronizará el stock. Los precios no se modificarán."}
+                    </p>
                   </div>
                 </div>
-                <p style={{ margin: 0, fontSize: 13, color: "#64748b", maxWidth: 400 }}>
-                  El stock final será: <strong style={{ color: "#60a5fa" }}>stock gestión − {stockOffset}</strong>. Ejemplo: si tenés 4 en gestión, Tienda Nube recibirá <strong style={{ color: "#6ee7b7" }}>{Math.max(0, 4 - stockOffset)}</strong>.
-                </p>
               </div>
             </div>
+
             <div style={{ textAlign: "center" }}>
               <button onClick={runMatch} disabled={!gestMapping.stock || !tnMapping.stock || (!gestMapping.barcode && !gestMapping.name) || (!tnMapping.barcode && !tnMapping.name)}
                 style={{
@@ -655,6 +710,35 @@ function PriceSync() {
         {/* STEP 3: Preview & Download */}
         {step === 3 && matched && (
           <div>
+            {/* Mode indicator */}
+            {!syncPrices && (
+              <div style={{
+                padding: "10px 16px", marginBottom: 14, borderRadius: 10, display: "flex", alignItems: "center", gap: 10,
+                background: "#1e1b4b40", border: "1px solid #4338ca",
+              }}>
+                <span style={{ fontSize: 18 }}>ℹ️</span>
+                <span style={{ fontSize: 13, color: "#a5b4fc" }}>
+                  <strong>Modo solo stock</strong> — Los precios no se modificarán en el CSV de salida.
+                  <button onClick={() => { setStep(2); }} style={{
+                    marginLeft: 12, padding: "3px 10px", background: "#312e81", border: "1px solid #4338ca", borderRadius: 6, color: "#a5b4fc", fontSize: 12, cursor: "pointer"
+                  }}>Cambiar</button>
+                </span>
+              </div>
+            )}
+
+            {/* Visibility info */}
+            {tnMapping.visibility && (
+              <div style={{
+                padding: "10px 16px", marginBottom: 14, borderRadius: 10, display: "flex", alignItems: "center", gap: 10,
+                background: "#1a0a0a40", border: "1px solid #7f1d1d",
+              }}>
+                <span style={{ fontSize: 18 }}>👁️‍🗨️</span>
+                <span style={{ fontSize: 13, color: "#fca5a5" }}>
+                  <strong>Visibilidad automática</strong> — Los productos con stock 0 se marcarán como <strong>"NO"</strong> en "{tnMapping.visibility}" y no se mostrarán en la tienda. Los que tengan stock se marcarán como <strong>"SI"</strong>.
+                </span>
+              </div>
+            )}
+
             {/* Stats bar - clickable filters */}
             <div style={{ display: "flex", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
               {[
@@ -754,7 +838,7 @@ function PriceSync() {
                     <th style={{ padding: "12px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Stock Gestión</th>
                     <th style={{ padding: "12px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Stock TN</th>
                     <th style={{ padding: "12px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Stock nuevo</th>
-                    {gestMapping.price && tnMapping.price && (
+                    {priceActive && (
                       <>
                         <th style={{ padding: "12px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Precio Gestión</th>
                         <th style={{ padding: "12px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Precio TN</th>
@@ -765,7 +849,7 @@ function PriceSync() {
                 </thead>
                 <tbody>
                   {filtered.length === 0 && (
-                    <tr><td colSpan={gestMapping.price && tnMapping.price ? 10 : 7} style={{ padding: 40, textAlign: "center", color: "#475569" }}>No se encontraron coincidencias</td></tr>
+                    <tr><td colSpan={priceActive ? 10 : 7} style={{ padding: 40, textAlign: "center", color: "#475569" }}>No se encontraron coincidencias</td></tr>
                   )}
                   {filtered.map((r, i) => {
                     const realIdx = matched.indexOf(r);
@@ -795,9 +879,12 @@ function PriceSync() {
                         <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#64748b", fontSize: 15 }}>{r.tnStock}</td>
                         <td style={{ padding: "10px 14px", textAlign: "center" }}>
                           <input type="number" value={r.newStock} onChange={e => editNewStock(realIdx, e.target.value)}
-                            style={{ width: 64, padding: "6px 8px", background: "#0f2e1f", border: "1px solid #065f46", borderRadius: 6, color: "#6ee7b7", fontSize: 15, fontWeight: 800, textAlign: "center" }} />
+                            style={{ width: 64, padding: "6px 8px", background: r.newStock === 0 ? "#2a1215" : "#0f2e1f", border: r.newStock === 0 ? "1px solid #7f1d1d" : "1px solid #065f46", borderRadius: 6, color: r.newStock === 0 ? "#fca5a5" : "#6ee7b7", fontSize: 15, fontWeight: 800, textAlign: "center", transition: "all 0.2s" }} />
+                          {tnMapping.visibility && r.newStock === 0 && (
+                            <div style={{ fontSize: 10, color: "#f87171", marginTop: 3, fontWeight: 700 }}>👁️‍🗨️ Oculto</div>
+                          )}
                         </td>
-                        {gestMapping.price && tnMapping.price && (
+                        {priceActive && (
                           <>
                             <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 14 }}>${r.gestPrice || "—"}</td>
                             <td style={{ padding: "10px 14px", textAlign: "center", fontWeight: 700, color: "#64748b", fontSize: 14 }}>${r.tnPrice || "—"}</td>
@@ -847,7 +934,7 @@ function PriceSync() {
                           <th style={{ padding: "10px 12px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase" }}>Cód. Barras</th>
                           <th style={{ padding: "10px 12px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase" }}>Stock</th>
                           <th style={{ padding: "10px 12px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase" }}>Stock nuevo</th>
-                          {gestMapping.price && tnMapping.price && (
+                          {priceActive && (
                             <th style={{ padding: "10px 12px", textAlign: "center", fontWeight: 700, color: "#94a3b8", fontSize: 11, textTransform: "uppercase" }}>Precio</th>
                           )}
                         </tr>
@@ -868,7 +955,7 @@ function PriceSync() {
                               <input type="number" value={r.newStock} onChange={e => editNewProductStock(i, e.target.value)}
                                 style={{ width: 64, padding: "5px 6px", background: "#0f2e1f", border: "1px solid #065f46", borderRadius: 6, color: "#6ee7b7", fontSize: 14, fontWeight: 800, textAlign: "center" }} />
                             </td>
-                            {gestMapping.price && tnMapping.price && (
+                            {priceActive && (
                               <td style={{ padding: "8px 12px", textAlign: "center" }}>
                                 <input type="text" value={r.newPrice || ""} onChange={e => editNewProductPrice(i, e.target.value)}
                                   style={{ width: 80, padding: "5px 6px", background: "#1a1a2e", border: "1px solid #3b1f7a", borderRadius: 6, color: "#c4b5fd", fontSize: 14, fontWeight: 800, textAlign: "center" }} />
@@ -893,6 +980,7 @@ function PriceSync() {
                 </button>
                 <p style={{ marginTop: 10, fontSize: 12, color: "#64748b" }}>
                   Se exportarán {stats.confirmed} productos confirmados
+                  {!syncPrices && <span style={{ color: "#a5b4fc" }}> (solo stock)</span>}
                   {unmatched.filter(r=>r.selected).length > 0 && <span style={{ color: "#fbbf24" }}> + {unmatched.filter(r=>r.selected).length} nuevos</span>}
                 </p>
                 {csvInfo && csvInfo.barcodes > 0 && (
@@ -903,6 +991,11 @@ function PriceSync() {
                 {csvInfo && csvInfo.newProducts > 0 && (
                   <div style={{ marginTop: 8, padding: "8px 16px", display: "inline-block", background: "#713f12", border: "1px solid #f59e0b", borderRadius: 8, marginLeft: 8 }}>
                     <span style={{ fontSize: 13, color: "#fbbf24" }}>🆕 {csvInfo.newProducts} producto{csvInfo.newProducts !== 1 ? "s" : ""} nuevo{csvInfo.newProducts !== 1 ? "s" : ""} agregado{csvInfo.newProducts !== 1 ? "s" : ""} al CSV</span>
+                  </div>
+                )}
+                {csvInfo && tnMapping.visibility && csvInfo.hiddenCount > 0 && (
+                  <div style={{ marginTop: 8, padding: "8px 16px", display: "inline-block", background: "#451a1a", border: "1px solid #7f1d1d", borderRadius: 8, marginLeft: 8 }}>
+                    <span style={{ fontSize: 13, color: "#fca5a5" }}>👁️‍🗨️ {csvInfo.hiddenCount} producto{csvInfo.hiddenCount !== 1 ? "s" : ""} oculto{csvInfo.hiddenCount !== 1 ? "s" : ""} en tienda (stock 0)</span>
                   </div>
                 )}
               </div>
