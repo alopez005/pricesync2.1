@@ -124,6 +124,12 @@ async function parseExcel(file) {
 
 function detectColumn(headers, keywords) {
   const norm = headers.map(h => normalize(h));
+  // Pass 1: exact match
+  for (const kw of keywords) {
+    const idx = norm.findIndex(h => h === kw);
+    if (idx !== -1) return headers[idx];
+  }
+  // Pass 2: includes match
   for (const kw of keywords) {
     const idx = norm.findIndex(h => h.includes(kw));
     if (idx !== -1) return headers[idx];
@@ -137,7 +143,7 @@ function PriceSync() {
   const [tnData, setTnData] = useState(null);
   const [gestFile, setGestFile] = useState(null);
   const [tnFile, setTnFile] = useState(null);
-  const [gestMapping, setGestMapping] = useState({ barcode: "", name: "", stock: "", price: "" });
+  const [gestMapping, setGestMapping] = useState({ barcode: "", name: "", stock: "", price: "", provider: "" });
   const [tnMapping, setTnMapping] = useState({ barcode: "", name: "", stock: "", sku: "", price: "", visibility: "" });
   const [matched, setMatched] = useState(null);
   const [unmatched, setUnmatched] = useState([]);
@@ -147,6 +153,7 @@ function PriceSync() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [syncPrices, setSyncPrices] = useState(true);
+  const [selectedProvider, setSelectedProvider] = useState("");
   const gestRef = useRef(null);
   const tnRef = useRef(null);
 
@@ -169,11 +176,13 @@ function PriceSync() {
       setGestData(data);
       // auto-detect columns
       setGestMapping({
-        barcode: detectColumn(data.headers, ["codigo de barra", "codigo_barra", "barcode", "ean", "cod_barra", "codigo barra", "codigodebarra", "cod barra"]) || "",
-        name: detectColumn(data.headers, ["nombre", "descripcion", "producto", "articulo", "name", "detalle", "denominacion"]) || "",
+        barcode: detectColumn(data.headers, ["codigo", "codigo de barra", "codigo_barra", "barcode", "ean", "cod_barra", "codigo barra", "codigodebarra", "cod barra"]) || "",
+        name: detectColumn(data.headers, ["descripcion", "nombre", "producto", "articulo", "name", "detalle", "denominacion"]) || "",
         stock: detectColumn(data.headers, ["stock", "cantidad", "existencia", "qty", "inventario", "disponible", "saldo"]) || "",
         price: detectColumn(data.headers, ["precio lista 2", "precio_lista2", "precio lista2", "preciolista2", "lista 2", "lista2", "precio de lista 2", "precio venta", "precio", "price", "pvp", "precio lista"]) || "",
+        provider: detectColumn(data.headers, ["marca", "proveedor", "provider", "distribuidor", "fabricante", "supplier"]) || "",
       });
+      setSelectedProvider("");
     } catch (err) { setError("Error al leer archivo de gestión: " + err.message); }
     setLoading(false);
   }, []);
@@ -203,6 +212,24 @@ function PriceSync() {
   // Determine if price columns are effectively active (mapped AND toggle on)
   const priceActive = syncPrices && gestMapping.price && tnMapping.price;
 
+  // ── provider list (unique values from provider column) ──
+  const providerList = useMemo(() => {
+    if (!gestData || !gestMapping.provider) return [];
+    const set = new Set();
+    gestData.rows.forEach(r => {
+      const val = String(r[gestMapping.provider] || "").trim();
+      if (val) set.add(val);
+    });
+    return [...set].sort((a, b) => a.localeCompare(b, "es"));
+  }, [gestData, gestMapping.provider]);
+
+  // ── filtered gestión rows (by provider if selected) ──
+  const gestFilteredRows = useMemo(() => {
+    if (!gestData) return [];
+    if (!selectedProvider || !gestMapping.provider) return gestData.rows;
+    return gestData.rows.filter(r => String(r[gestMapping.provider] || "").trim() === selectedProvider);
+  }, [gestData, gestMapping.provider, selectedProvider]);
+
   // ── matching engine ──
   const runMatch = useCallback(() => {
     if (!gestData || !tnData) return;
@@ -213,7 +240,7 @@ function PriceSync() {
 
     // Pass 1: barcode exact match
     if (gestMapping.barcode && tnMapping.barcode) {
-      gestData.rows.forEach((gRow) => {
+      gestFilteredRows.forEach((gRow) => {
         const gBarcode = String(gRow[gestMapping.barcode] || "").trim();
         if (!gBarcode) return;
         const tnIdx = tnData.rows.findIndex((tRow, idx) => {
@@ -246,7 +273,7 @@ function PriceSync() {
 
     // Pass 2: name fuzzy match
     if (gestMapping.name && tnMapping.name) {
-      gestData.rows.forEach((gRow) => {
+      gestFilteredRows.forEach((gRow) => {
         const gName = normalize(gRow[gestMapping.name]);
         if (!gName) return;
         // check not already matched by barcode
@@ -309,7 +336,7 @@ function PriceSync() {
     const matchedGestNames = new Set(results.map(r => normalize(r.gestName)));
     const matchedBarcodes = new Set(results.map(r => r.barcode).filter(Boolean));
     const newProducts = [];
-    gestData.rows.forEach((gRow) => {
+    gestFilteredRows.forEach((gRow) => {
       const gName = gestMapping.name ? normalize(gRow[gestMapping.name]) : "";
       const gBarcode = gestMapping.barcode ? String(gRow[gestMapping.barcode] || "").trim() : "";
       if (gBarcode && matchedBarcodes.has(gBarcode)) return;
@@ -332,7 +359,7 @@ function PriceSync() {
 
     setStep(3);
     setLoading(false);
-  }, [gestData, tnData, gestMapping, tnMapping, stockOffset]);
+  }, [gestData, tnData, gestMapping, tnMapping, stockOffset, gestFilteredRows]);
 
   // ── toggle confirmation ──
   const toggleConfirm = useCallback((idx) => {
@@ -394,13 +421,13 @@ function PriceSync() {
       return h.includes(delim) || h.includes('"') ? '"' + h.replace(/"/g, '""') + '"' : h;
     }).join(delim);
     const rows = tnData.rows.map((row, idx) => {
+      // Skip rows that were not modified
+      if (!confirmedMap.has(idx)) return null;
       const updatedRow = { ...row };
-      if (confirmedMap.has(idx)) {
-        updatedRow[stockCol] = confirmedMap.get(idx);
-        // Set "Mostrar en tienda" based on stock
-        if (tnMapping.visibility) {
-          updatedRow[tnMapping.visibility] = confirmedMap.get(idx) > 0 ? "SI" : "NO";
-        }
+      updatedRow[stockCol] = confirmedMap.get(idx);
+      // Set "Mostrar en tienda" based on stock
+      if (tnMapping.visibility) {
+        updatedRow[tnMapping.visibility] = confirmedMap.get(idx) > 0 ? "SI" : "NO";
       }
       if (barcodeCol && barcodeMap.has(idx)) {
         updatedRow[barcodeCol] = barcodeMap.get(idx);
@@ -414,7 +441,7 @@ function PriceSync() {
           ? '"' + val.replace(/"/g, '""') + '"'
           : val;
       }).join(delim);
-    });
+    }).filter(Boolean);
 
     // Append selected new products as new rows
     const selectedNew = unmatched.filter(r => r.selected);
@@ -445,13 +472,61 @@ function PriceSync() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "tiendanube_stock_actualizado.csv";
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const yy = String(now.getFullYear()).slice(-2);
+    const dateStr = `${dd}-${mm}-${yy}`;
+    const provStr = selectedProvider
+      ? `_${selectedProvider.replace(/[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑ ]/g, "").replace(/\s+/g, "_")}`
+      : "";
+    a.download = `tiendanube_actualizado${provStr}_${dateStr}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 
     setCsvInfo({ barcodes: barcodeMap.size, newProducts: selectedNew.length, hiddenCount: matched.filter(r => r.confirmed && r.newStock === 0).length + selectedNew.filter(r => r.newStock === 0).length });
+  }
+
+  // ── download CSV with only dudosos (weak name matches) ──
+  function downloadDudososCSV() {
+    if (!matched || !tnData) return;
+    const dudosos = matched.filter(r => r.matchType === "name_weak");
+    if (dudosos.length === 0) return;
+
+    const delim = tnData.delimiter || ",";
+    // Build a simple CSV with the relevant columns for review
+    const headers = ["Producto Gestión", "Producto TiendaNube", "Cód. Barras Gestión", "Cód. Barras TN", "Score (%)", "Stock Gestión", "Stock TN"];
+    const headerLine = headers.map(h => '"' + h + '"').join(delim);
+    const rows = dudosos.map(r => {
+      const tnBarcode = tnMapping.barcode ? String(r.tnRow[tnMapping.barcode] || "").trim() : "";
+      return [
+        r.gestName,
+        r.tnName,
+        r.barcode || "",
+        tnBarcode,
+        Math.round(r.matchScore || 0),
+        r.gestStock,
+        r.tnStock,
+      ].map(v => {
+        const s = String(v);
+        return s.includes(delim) || s.includes('"') || s.includes("\n")
+          ? '"' + s.replace(/"/g, '""') + '"'
+          : s;
+      }).join(delim);
+    });
+
+    const csv = [headerLine, ...rows].join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "dudosos_para_revisar.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   // ── filtered results ──
@@ -635,7 +710,40 @@ function PriceSync() {
                   onChange={v => setGestMapping(p => ({ ...p, stock: v }))} />
                 <Select label="Precio (Lista 2)" value={gestMapping.price} options={gestData?.headers || []}
                   onChange={v => setGestMapping(p => ({ ...p, price: v }))} disabled={!syncPrices} />
+                <Select label="Proveedor (opcional)" value={gestMapping.provider} options={gestData?.headers || []}
+                  onChange={v => { setGestMapping(p => ({ ...p, provider: v })); setSelectedProvider(""); }} />
               </div>
+              {/* Provider filter */}
+              {gestMapping.provider && providerList.length > 0 && (
+                <div style={{ marginTop: 16, padding: 16, background: "#1a2744", borderRadius: 10, border: selectedProvider ? "1px solid #8b5cf6" : "1px solid #334155", transition: "border-color 0.3s" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                    <span style={{ fontSize: 16 }}>🏭</span>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0" }}>Filtrar por proveedor</div>
+                      <div style={{ fontSize: 11, color: "#64748b" }}>Solo se compararán productos de este proveedor ({providerList.length} proveedores encontrados)</div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <select value={selectedProvider} onChange={e => setSelectedProvider(e.target.value)} style={{
+                      flex: 1, minWidth: 200, padding: "10px 12px", background: "#1e293b", color: "#e2e8f0",
+                      border: "1px solid #334155", borderRadius: 8, fontSize: 14, cursor: "pointer", outline: "none"
+                    }}>
+                      <option value="">— Todos los proveedores —</option>
+                      {providerList.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                    {selectedProvider && (
+                      <button onClick={() => setSelectedProvider("")} style={{
+                        padding: "10px 16px", background: "#312e81", border: "1px solid #4338ca", borderRadius: 8, color: "#a5b4fc", fontSize: 13, fontWeight: 700, cursor: "pointer"
+                      }}>✕ Limpiar filtro</button>
+                    )}
+                  </div>
+                  {selectedProvider && (
+                    <div style={{ marginTop: 10, fontSize: 13, color: "#a78bfa", fontWeight: 600 }}>
+                      📦 {gestFilteredRows.length} productos de "{selectedProvider}" (de {gestData?.rows.length || 0} totales)
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <div style={{ padding: 24, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, marginBottom: 20 }}>
               <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700 }}>🛒 Columnas del CSV Tienda Nube</h3>
@@ -726,6 +834,22 @@ function PriceSync() {
               </div>
             )}
 
+            {/* Provider filter info */}
+            {selectedProvider && (
+              <div style={{
+                padding: "10px 16px", marginBottom: 14, borderRadius: 10, display: "flex", alignItems: "center", gap: 10,
+                background: "#312e8140", border: "1px solid #6366f1",
+              }}>
+                <span style={{ fontSize: 18 }}>🏭</span>
+                <span style={{ fontSize: 13, color: "#a5b4fc" }}>
+                  <strong>Filtrado por proveedor:</strong> {selectedProvider} ({gestFilteredRows.length} productos)
+                  <button onClick={() => { setSelectedProvider(""); setStep(2); }} style={{
+                    marginLeft: 12, padding: "3px 10px", background: "#312e81", border: "1px solid #4338ca", borderRadius: 6, color: "#a5b4fc", fontSize: 12, cursor: "pointer"
+                  }}>Cambiar</button>
+                </span>
+              </div>
+            )}
+
             {/* Visibility info */}
             {tnMapping.visibility && (
               <div style={{
@@ -791,9 +915,16 @@ function PriceSync() {
                   {filterType === "name_strong" && `Mostrando ${filtered.length} coincidencias fuertes por nombre`}
                   {filterType === "name_weak" && `⚠️ Mostrando ${filtered.length} coincidencias dudosas — revisá y destildá las incorrectas`}
                 </span>
-                <button onClick={() => setFilterType("all")} style={{
-                  padding: "4px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 6, color: "#94a3b8", fontSize: 12, cursor: "pointer"
-                }}>Ver todos</button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {filterType === "name_weak" && (
+                    <button onClick={downloadDudososCSV} style={{
+                      padding: "4px 12px", background: "#7c2d12", border: "1px solid #fb923c", borderRadius: 6, color: "#fb923c", fontSize: 12, fontWeight: 700, cursor: "pointer"
+                    }}>⬇ Exportar dudosos</button>
+                  )}
+                  <button onClick={() => setFilterType("all")} style={{
+                    padding: "4px 12px", background: "#1e293b", border: "1px solid #334155", borderRadius: 6, color: "#94a3b8", fontSize: 12, cursor: "pointer"
+                  }}>Ver todos</button>
+                </div>
               </div>
             )}
             {filterType === "new" && (
